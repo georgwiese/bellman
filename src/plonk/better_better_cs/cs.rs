@@ -157,6 +157,10 @@ pub trait Gate<E: Engine>: GateInternal<E>
     }
 }
 
+use smallvec::SmallVec;
+
+pub const DEFAULT_SMALLVEC_CAPACITY: usize = 8;
+
 pub trait MainGate<E: Engine>: Gate<E> {
     const NUM_LINEAR_TERMS: usize;
     const NUM_VARIABLES: usize;
@@ -166,10 +170,10 @@ pub trait MainGate<E: Engine>: Gate<E> {
     fn range_of_linear_terms() -> std::ops::Range<usize>;
     fn index_for_constant_term() -> usize;
     fn range_of_next_step_linear_terms() -> std::ops::Range<usize>;
-    fn format_term(instance: MainGateTerm<E>, padding: Variable) -> Result<(Vec<Variable>, Vec<E::Fr>), SynthesisError>;
-    fn format_linear_term_with_duplicates(instance: MainGateTerm<E>, padding: Variable) -> Result<(Vec<Variable>, Vec<E::Fr>), SynthesisError>;
-    fn dummy_vars_to_inscribe(dummy: Variable) -> Vec<Variable>;
-    fn empty_coefficients() -> Vec<E::Fr>;
+    fn format_term(instance: MainGateTerm<E>, padding: Variable) -> Result<(SmallVec<[Variable; DEFAULT_SMALLVEC_CAPACITY]>, SmallVec<[E::Fr; DEFAULT_SMALLVEC_CAPACITY]>), SynthesisError>;
+    fn format_linear_term_with_duplicates(instance: MainGateTerm<E>, padding: Variable) -> Result<(SmallVec<[Variable; DEFAULT_SMALLVEC_CAPACITY]>, SmallVec<[E::Fr; DEFAULT_SMALLVEC_CAPACITY]>), SynthesisError>;
+    fn dummy_vars_to_inscribe(dummy: Variable) -> SmallVec<[Variable; DEFAULT_SMALLVEC_CAPACITY]>;
+    fn empty_coefficients() -> SmallVec<[E::Fr; DEFAULT_SMALLVEC_CAPACITY]>;
     fn contribute_into_quotient_for_public_inputs<'a, 'b>(
         &self, 
         domain_size: usize,
@@ -251,7 +255,7 @@ impl LinearCombinationOfTerms {
 
 #[derive(Clone, Debug)]
 pub enum ArithmeticTerm<E: Engine>{
-    Product(Vec<Variable>, E::Fr),
+    Product(smallvec::SmallVec<[Variable; 2]>, E::Fr),
     SingleVariable(Variable, E::Fr),
     Constant(E::Fr),
 }
@@ -277,12 +281,12 @@ impl<E: Engine> ArithmeticTerm<E> {
                 ArithmeticTerm::Product(terms, coeff)
             },
             ArithmeticTerm::SingleVariable(this, coeff) => {
-                let terms = vec![this, other];
+                let terms = smallvec::smallvec![this, other];
 
                 ArithmeticTerm::Product(terms, coeff)
             },
             ArithmeticTerm::Constant(coeff) => {
-                let terms = vec![other];
+                let terms = smallvec::smallvec![other];
 
                 ArithmeticTerm::Product(terms, coeff)
             },
@@ -304,9 +308,11 @@ impl<E: Engine> ArithmeticTerm<E> {
     }
 }
 
+const DEFAULT_SMALLVEC_CAPACITY_FOR_TERM: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct MainGateTerm<E: Engine>{
-    pub(crate) terms: Vec<ArithmeticTerm<E>>,
+    pub(crate) terms: smallvec::SmallVec<[ArithmeticTerm<E>; DEFAULT_SMALLVEC_CAPACITY_FOR_TERM]>,
     pub(crate) vars_scratch: std::collections::HashMap<Variable, usize>,
     pub(crate) num_multiplicative_terms: usize,
     pub(crate) num_constant_terms: usize
@@ -315,8 +321,8 @@ pub struct MainGateTerm<E: Engine>{
 impl<E: Engine> MainGateTerm<E> {
     pub fn new() -> Self {
         Self {
-            terms: Vec::with_capacity(8),
-            vars_scratch: std::collections::HashMap::with_capacity(8),
+            terms: smallvec::smallvec![],
+            vars_scratch: std::collections::HashMap::with_capacity(DEFAULT_SMALLVEC_CAPACITY_FOR_TERM),
             num_multiplicative_terms: 0,
             num_constant_terms: 0
         }
@@ -781,13 +787,18 @@ impl_poly_storage! {
                 setup_map: std::collections::HashMap::new(),
             }
         }
-    
-        pub fn new_for_size(size: usize) -> Self {
+
+
+        pub fn new_specialized_for_proving_assembly_and_state_4(size: usize) -> Self {
             assert!(size <= 1 << <E::Fr as PrimeField>::S);
+            let mut state_map = std::collections::HashMap::new();
+            for idx in 0..4{
+                state_map.insert(PolyIdentifier::VariablesPolynomial(idx), new_vec_with_allocator!(size));
+            }
             Self {
-                state_map: std::collections::HashMap::with_capacity(size),
-                witness_map: std::collections::HashMap::with_capacity(size),
-                setup_map: std::collections::HashMap::with_capacity(size),
+                state_map,
+                witness_map: std::collections::HashMap::new(),
+                setup_map: std::collections::HashMap::new(),
             }
         }
     
@@ -898,7 +909,14 @@ pub struct Assembly<E: Engine, P: PlonkConstraintSystemParams<E>, MG: MainGate<E
 
     pub individual_table_canonical_sorted_entries: std::collections::HashMap<String, Vec<[E::Fr; 3]>>,
     pub individual_table_entries_lookups: std::collections::HashMap<String, std::collections::HashMap<[E::Fr; 3], usize>>,
+    #[cfg(feature = "allocator")]
+    pub individual_table_entries: std::collections::HashMap<String, Vec<u32, A>>,
+    #[cfg(not(feature = "allocator"))]
     pub individual_table_entries: std::collections::HashMap<String, Vec<u32>>,
+    #[cfg(feature = "allocator")]
+    pub reusable_buffer_for_lookup_entries: Vec<Vec<u32, A>>,
+    #[cfg(not(feature = "allocator"))]
+    pub reusable_buffer_for_lookup_entries: Vec<Vec<u32>>,
     pub individual_multitable_entries: std::collections::HashMap<String, Vec<Vec<E::Fr>>>,
     pub known_table_ids: Vec<E::Fr>,
     pub num_table_lookups: usize,
@@ -934,6 +952,7 @@ impl_assembly!{
         type MainGate = MG;
     
         // allocate a variable
+        #[inline]
         fn alloc<F>(&mut self, value: F) -> Result<Variable, SynthesisError>
         where
             F: FnOnce() -> Result<E::Fr, SynthesisError> 
@@ -984,10 +1003,12 @@ impl_assembly!{
             Ok(input_var)
         }
     
+        #[inline]
         fn get_main_gate(&self) -> &MG {
             &self.main_gate
         }
     
+        #[inline]
         fn begin_gates_batch_for_step(&mut self) -> Result<(), SynthesisError> {
             debug_assert!(self.trace_step_for_batch.is_none());
             let n = self.num_aux_gates;
@@ -1083,6 +1104,7 @@ impl_assembly!{
             Ok(())
         }
     
+        #[inline]
         fn get_value(&self, var: Variable) -> Result<E::Fr, SynthesisError> {
             if !S::PRODUCE_WITNESS {
                 return Err(SynthesisError::AssignmentMissing);
@@ -1166,7 +1188,7 @@ impl_assembly!{
             let table_name = table.functional_name();
             let table_id = table.table_id();
             let number_of_entries = table.size();
-
+    
             // ensure sorted format when we add table
             let mut entries = Self::ensure_sorted_table(&table);
             assert_eq!(entries.len(), 3);
@@ -1185,8 +1207,18 @@ impl_assembly!{
     
             self.tables.push(shared);
             self.individual_table_canonical_sorted_entries.insert(table_name.clone(), entries_as_arrays);
-            self.individual_table_entries_lookups.insert(table_name.clone(), entries_into_table_row);
-            self.individual_table_entries.insert(table_name.clone(), vec![]);
+            self.individual_table_entries_lookups.insert(table_name.clone(), entries_into_table_row);            
+            let buffer_for_current_table = if let Some(mut buffer) =  self.reusable_buffer_for_lookup_entries.pop(){
+                unsafe{
+                    buffer.set_len(0);
+                };
+                buffer
+            }else{
+                println!("allocating new buffer for table {}", table_name);
+                new_vec_with_allocator!(0)
+            };
+            
+            self.individual_table_entries.insert(table_name.clone(), buffer_for_current_table);
             self.table_selectors.insert(table_name, BitVec::new());
             self.known_table_ids.push(table_id);
     
@@ -1216,7 +1248,7 @@ impl_assembly!{
             assert!(exists == false);
             self.multitables.push(Arc::from(table));
             self.multitable_selectors.insert(table_name.clone(), BitVec::new());
-            self.individual_table_entries.insert(table_name.clone(), vec![]);
+            self.individual_table_entries.insert(table_name.clone(), new_vec_with_allocator!(0));
     
             Ok(())
         }
@@ -1266,24 +1298,24 @@ impl_assembly!{
     
                 // add values for lookup table sorting later
                 let keys_and_values_len = table.applies_over().len();
-                let mut table_entries = Vec::with_capacity(keys_and_values_len);
+                let mut table_entries = arrayvec::ArrayVec::<_, 3>::new();
                 for v in variables.iter() {
                     let value = self.get_value(*v).unwrap();
                     table_entries.push(value);
                 }
                 use std::convert::TryInto;
-                let table_entries_as_array: [_; 3] = table_entries.try_into().unwrap();
+                let table_entries_as_array: [_; 3] = table_entries.into_inner().unwrap();
     
                 let entries = self.individual_table_entries.get_mut(&table_name).unwrap();
                 assert_eq!(variables.len(), table.applies_over().len());
 
-                // TODO: we can substitute a check for valid entry entirely later on
-                let valid_entries = table.is_valid_entry(&table_entries_as_array[..keys_and_values_len]);
-                assert!(valid_entries);
+                // // This check is substituted by the lookup from values into index below
+                // let valid_entries = table.is_valid_entry(&table_entries_as_array[..keys_and_values_len]);
+                // assert!(valid_entries);
     
-                if !valid_entries {
-                    return Err(SynthesisError::Unsatisfiable);
-                }
+                // if !valid_entries {
+                //     return Err(SynthesisError::Unsatisfiable);
+                // }
 
                 let row_idx = self.individual_table_entries_lookups.get(&table_name).unwrap().get(&table_entries_as_array);
                 assert!(row_idx.is_some(), "table most likely doesn't contain a row for {:?}", table_entries_as_array);
@@ -1299,41 +1331,6 @@ impl_assembly!{
         #[track_caller]
         fn apply_multi_lookup_gate(&mut self, variables: &[Variable], table: Arc<MultiTableApplication<E>>) -> Result<(), SynthesisError> {
             unimplemented!("not implementing multitable for now");
-            // let n = self.trace_step_for_batch.expect("may only add table constraint in a transaction");
-    
-            // if S::PRODUCE_SETUP {
-            //     let table_name = table.functional_name();
-            //     let tracker = self.multitable_selectors.get_mut(&table_name).unwrap();
-            //     if tracker.len() != n {
-            //         let padding = n - tracker.len();
-            //         tracker.grow(padding, false);
-            //     }
-            //     tracker.push(true);
-            //     debug_assert_eq!(n+1, tracker.len());
-    
-            //     self.table_ids_poly.resize(n, E::Fr::zero());
-            //     self.table_ids_poly.push(table.table_id());
-            // }
-    
-            // if S::PRODUCE_WITNESS {
-            //     let table_name = table.functional_name();
-            //     let mut table_entries = Vec::with_capacity(table.applies_over().len());
-            //     for v in variables.iter() {
-            //         let value = self.get_value(*v).unwrap();
-            //         table_entries.push(value);
-            //     }
-        
-            //     let entries = self.individual_table_entries.get_mut(&table_name).unwrap();
-            //     assert_eq!(variables.len(), table.applies_over().len());
-        
-            //     assert!(table.is_valid_entry(&table_entries));
-    
-            //     entries.push(table_entries);
-            // }
-    
-            // self.num_multitable_lookups += 1;
-    
-            // Ok(())
         }
     
         fn get_current_step_number(&self) -> usize {
@@ -1429,7 +1426,7 @@ impl_assembly!{
             }        
         }
 
-        pub fn new() -> Self {
+        pub fn new() -> Self {            
             let mut tmp = Self {
                 inputs_storage: PolynomialStorage::new(),
                 aux_storage: PolynomialStorage::new(),
@@ -1472,6 +1469,7 @@ impl_assembly!{
                 individual_table_canonical_sorted_entries: std::collections::HashMap::new(),
                 individual_table_entries_lookups: std::collections::HashMap::new(),
                 individual_table_entries: std::collections::HashMap::new(),
+                reusable_buffer_for_lookup_entries: vec![],
                 individual_multitable_entries: std::collections::HashMap::new(),
 
                 known_table_ids: vec![],
@@ -1488,13 +1486,14 @@ impl_assembly!{
             tmp.add_gate_into_list(&MG::default());
 
             tmp
-        }
-        
-        pub fn new_for_size(size: usize) -> Self {
-            assert!(size <= 1 << <E::Fr as PrimeField>::S);
+        }        
+
+        pub fn new_specialized_for_proving_assembly_and_state_4(domain_size: usize, aux_size: usize, num_lookup_tables: usize, max_num_lookup_entries: usize) -> Self {
+            assert!(domain_size <= 1 << <E::Fr as PrimeField>::S);
+            let reusable_buffer_for_lookup_entries = (0..num_lookup_tables).map(|_| new_vec_with_allocator!(max_num_lookup_entries)).collect();
             let mut tmp = Self {
-                inputs_storage: PolynomialStorage::new_for_size(size),
-                aux_storage: PolynomialStorage::new_for_size(size),
+                inputs_storage: PolynomialStorage::new(),
+                aux_storage: PolynomialStorage::new_specialized_for_proving_assembly_and_state_4(domain_size),
 
                 max_constraint_degree: 0,
 
@@ -1505,7 +1504,7 @@ impl_assembly!{
                 num_aux: 0,
 
                 input_assingments: vec![],
-                aux_assingments: new_vec_with_allocator!(size),
+                aux_assingments: new_vec_with_allocator!(aux_size),
 
                 main_gate: MG::default(),
 
@@ -1526,14 +1525,15 @@ impl_assembly!{
 
                 tables: vec![],
                 multitables: vec![],
-                table_selectors: std::collections::HashMap::with_capacity(size),
-                multitable_selectors: std::collections::HashMap::with_capacity(size),
+                table_selectors: std::collections::HashMap::new(),
+                multitable_selectors: std::collections::HashMap::new(),
                 table_ids_poly: vec![],
                 total_length_of_all_tables: 0,
 
                 individual_table_canonical_sorted_entries: std::collections::HashMap::new(),
                 individual_table_entries_lookups: std::collections::HashMap::new(),
                 individual_table_entries: std::collections::HashMap::new(),
+                reusable_buffer_for_lookup_entries: reusable_buffer_for_lookup_entries,
                 individual_multitable_entries: std::collections::HashMap::new(),
 
                 known_table_ids: vec![],
@@ -1551,6 +1551,7 @@ impl_assembly!{
 
             tmp
         }
+
 
         // return variable that is not in a constraint formally, but has some value
         const fn dummy_variable() -> Variable {
