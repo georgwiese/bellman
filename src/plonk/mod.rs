@@ -137,6 +137,7 @@ pub fn prove_native_by_steps<E: Engine, C: crate::plonk::better_cs::cs::Circuit<
     setup_precomputations: Option<&SetupPolynomialsPrecomputations<E, PlonkCsWidth4WithNextStepParams>>,
     csr_mon_basis: &Crs<E, CrsForMonomialForm>,
     transcript_init_params: Option< <T as Prng<E::Fr> >:: InitializationParameters>,
+    worker_cpus: Option<usize>,
 ) -> Result<Proof<E, PlonkCsWidth4WithNextStepParams>, SynthesisError> {
     use crate::plonk::better_cs::utils::{commit_point_as_xy};
     use crate::plonk::better_cs::prover::prove_steps::{FirstVerifierMessage, SecondVerifierMessage, ThirdVerifierMessage, FourthVerifierMessage};
@@ -152,7 +153,10 @@ pub fn prove_native_by_steps<E: Engine, C: crate::plonk::better_cs::cs::Circuit<
 
     println!("Synthesis taken {:?}", subtime.elapsed());
 
-    let worker = Worker::new();
+    let worker = match worker_cpus {
+        Some(n) => Worker::new_with_cpus(n),
+        None => Worker::new(),
+    };
 
     let now = Instant::now();
 
@@ -332,6 +336,7 @@ pub fn prove_by_steps<E: Engine, C: crate::Circuit<E>, T: Transcript<E::Fr>>(
     setup_precomputations: Option<&SetupPolynomialsPrecomputations<E, PlonkCsWidth4WithNextStepParams>>,
     csr_mon_basis: &Crs<E, CrsForMonomialForm>,
     transcript_init_params: Option< <T as Prng<E::Fr> >:: InitializationParameters>,
+    worker_cpus: Option<usize>,
 ) -> Result<Proof<E, PlonkCsWidth4WithNextStepParams>, SynthesisError> {
     use crate::plonk::better_cs::cs::Circuit;
     use crate::plonk::better_cs::utils::{commit_point_as_xy};
@@ -344,7 +349,8 @@ pub fn prove_by_steps<E: Engine, C: crate::Circuit<E>, T: Transcript<E::Fr>>(
         setup, 
         setup_precomputations, 
         csr_mon_basis,
-        transcript_init_params
+        transcript_init_params,
+        worker_cpus,
     )
 }
 
